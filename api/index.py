@@ -16,7 +16,7 @@ load_dotenv(dotenv_path=env_path)
 app = Flask(__name__)
 CORS(app)
 
-# Stage 1 Client (Groq - Llama Scout for OCR)
+# Stage 1 Client (Groq - Llama 4 Scout)
 groq_client = OpenAI(
     base_url="https://api.groq.com/openai/v1", 
     api_key=os.getenv("GROQ_API_KEY")
@@ -36,7 +36,7 @@ def clean_to_number(value):
 def predict():
     try:
         user_text = request.form.get('userText', '')
-        # Handle multiple files (max 5)
+        category = request.form.get('category', 'Main Dish')
         files = request.files.getlist('file')
         
         combined_ocr_results = ""
@@ -45,21 +45,25 @@ def predict():
             ocr_res = groq_client.chat.completions.create(
                 model="meta-llama/llama-4-scout-17b-16e-instruct",
                 messages=[{"role": "user", "content": [
-                    {"type": "text", "text": "List every food and drink item in this image."},
+                    {"type": "text", "text": f"Extract all food and drink names from this menu image."},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
                 ]}]
             )
             combined_ocr_results += f"\n[Photo {i+1}]: " + ocr_res.choices[0].message.content
 
-        # Combine with manual text
-        final_input = f"Manual Input: {user_text}\nOCR Data: {combined_ocr_results}"
+        final_input = f"Category Context: {category}\nManual Input: {user_text}\nOCR Context: {combined_ocr_results}"
 
         prompt = f"""
-        Analyze this Malaysian food data for a diabetic user:
-        {final_input}
+        Analyze the following Malaysian food data for the category: {category}.
+        
+        Instructions:
+        1. Identify 5 items that fit the category '{category}'.
+        2. Estimate Calories (c), Sugar in grams (sugar), and GI Index (gi_val as 0-100).
+        3. Determine GI level (Low/Med/High).
+        4. Provide an 'encouragement' tip for each.
         
         Return ONLY a JSON array.
-        Format: [{{"f": "name", "c": number, "ft": number, "gi": "Low/Med/High"}}]
+        Format: [{{"f": "string", "sugar": number, "c": number, "gi": "string", "gi_val": number, "tip": "string"}}]
         """
         
         response = gemini_model.generate_content(
@@ -69,27 +73,30 @@ def predict():
         
         raw_data = json.loads(response.text)
         
-        # Sanitize
         processed = []
         for item in raw_data:
             processed.append({
-                "f": item.get("f", "Unknown Dish"),
+                "f": item.get("f", "Unknown"),
+                "sugar": clean_to_number(item.get("sugar", 0)),
                 "c": clean_to_number(item.get("c", 0)),
-                "ft": clean_to_number(item.get("ft", 0)),
-                "gi": item.get("gi", "Med")
+                "gi": item.get("gi", "Med"),
+                "gi_val": clean_to_number(item.get("gi_val", 55)),
+                "tip": item.get("tip", "Better choice for health.")
             })
 
-        # Sorting Logic: GI (Low first), then Calories
-        sorted_data = sorted(processed, key=lambda x: (x['gi'] != 'Low', x['gi'] == 'High', x['c']))
+        # RANKING LOGIC: 
+        # 1. GI Value (Lowest first)
+        # 2. Sugar content (Lowest first - used if GI levels are the same)
+        sorted_data = sorted(processed, key=lambda x: (x['gi_val'], x['sugar']))
         
         return jsonify({
-            "best": sorted_data[0] if sorted_data else None,
-            "next_three": sorted_data[1:4],
-            "all": processed
+            "recommended": sorted_data[0] if sorted_data else None,
+            "ranking": sorted_data[:3],
+            "category": category
         })
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Server Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
