@@ -8,14 +8,17 @@ from openai import OpenAI
 import google.generativeai as genai
 from dotenv import load_dotenv
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv(dotenv_path=Path(__file__).parent.parent / '.env')
 
 app = Flask(__name__)
 CORS(app)
 
-# Clients
+# Stage 1: Groq OCR
 groq_client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=os.getenv("GROQ_API_KEY"))
+
+# Stage 2: Gemini Analysis
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 gemini_model = genai.GenerativeModel('gemini-3.1-flash-lite-preview')
 
@@ -25,61 +28,87 @@ def clean_to_number(value):
     try: return float(cleaned) if '.' in cleaned else int(cleaned)
     except: return 0
 
+def process_single_image(file_storage):
+    try:
+        image_base64 = base64.b64encode(file_storage.read()).decode('utf-8')
+        res = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "List food/drink names exactly as written on this menu."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+            ]}]
+        )
+        return res.choices[0].message.content
+    except:
+        return ""
+
 @app.route('/api/predict', methods=['POST'])
 def predict():
     try:
         user_text = request.form.get('userText', '')
         files = request.files.getlist('file')
         
-        # OCR Stage
-        combined_ocr_results = ""
-        for file in files[:5]:
-            image_base64 = base64.b64encode(file.read()).decode('utf-8')
-            ocr_res = groq_client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": "List food/drink names from this menu exactly as written."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
-                ]}]
-            )
-            combined_ocr_results += ocr_res.choices[0].message.content + "\n"
+        # Parallel OCR Processing
+        with ThreadPoolExecutor() as executor:
+            ocr_results = list(executor.map(process_single_image, files[:5]))
+        
+        combined_ocr = "\n".join(ocr_results)
 
-        # ALL-IN-ONE Analysis Prompt
+        # STRICTOR PROMPT WITH REFINED RANKING & HALLUCINATION CHECK
         prompt = f"""
         CONTEXT:
-        Menu Text: {combined_ocr_results}
+        Menu Text: {combined_ocr}
         Manual Input (comma separated): {user_text}
 
         TASK:
-        1. Extract ALL items from the context.
-        2. Categorize each item into: 'Appetizer', 'Main Dish', 'Dessert', or 'Drinks'.
-        3. STRICT: Only use items mentioned in the context.
-        4. For each: Estimate Sugar(g), Calories(kcal), GI Value(0-100), and GI Level.
-        5. Provide a tip.
+        1. Extract ALL food and drink items from the context.
+        2. Categorize into: 'Appetizer', 'Main Dish', 'Dessert', or 'Drinks'.
+        3. STRICT: Only use items mentioned in the Context. If an item isn't there, do not include it.
+        4. Estimate: Sugar(g), Calories(kcal), GI Value(0-100), and Risk Level (Low, Medium, or High).
+        5. Provide a short health tip (max 10 words).
+
+        HALLUCINATION CHECK: 
+        Recognize that plain items (e.g., 'Chinese Tea', 'Mineral Water') have 0g sugar and 0 GI. 
+        Do not rank flavored items (e.g., 'Matcha Jasmine') higher than plain items.
 
         Output ONLY JSON:
         {{
-            "Appetizer": [],
-            "Main Dish": [],
-            "Dessert": [],
-            "Drinks": []
+            "Appetizer": [], "Main Dish": [], "Dessert": [], "Drinks": []
         }}
-        Each list item: {{"f": "name", "sugar": num, "c": num, "gi": "Low/Med/High", "gi_val": num, "tip": "string"}}
+        Item format: {{"f": "name", "sugar": num, "c": num, "gi_val": num, "risk": "Low/Medium/High", "tip": "string"}}
         """
         
         response = gemini_model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         raw_data = json.loads(response.text)
         
-        # Sort each category once
         final_results = {}
+        risk_map = {"Low": 1, "Medium": 2, "High": 3}
+
         for cat in ["Appetizer", "Main Dish", "Dessert", "Drinks"]:
             items = raw_data.get(cat, [])
+            
+            # Sanitize and ensure numeric types
             for item in items:
                 item['sugar'] = clean_to_number(item.get('sugar', 0))
                 item['gi_val'] = clean_to_number(item.get('gi_val', 55))
+                item['c'] = clean_to_number(item.get('c', 0))
+                item['risk_score'] = risk_map.get(item.get('risk', 'Medium'), 2)
             
-            # GI first, then Sugar
-            sorted_items = sorted(items, key=lambda x: (x['gi_val'], x['sugar']))
+            # RANKING PRIORITY LOGIC:
+            # 1. Risk Level (Low first)
+            # 2. Sugar Content (Lowest first)
+            # 3. GI Value (Lowest first)
+            # 4. Calories (Lowest first - Final tie-breaker)
+            sorted_items = sorted(items, key=lambda x: (
+                x['risk_score'], 
+                x['sugar'], 
+                x['gi_val'], 
+                x['c']
+            ))
+            
+            # Remove the internal risk_score before sending to frontend
+            for s_item in sorted_items: s_item.pop('risk_score', None)
+
             final_results[cat] = {
                 "recommended": sorted_items[0] if sorted_items else None,
                 "ranking": sorted_items[:3]
@@ -88,7 +117,7 @@ def predict():
         return jsonify(final_results)
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Server Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
