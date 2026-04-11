@@ -15,10 +15,7 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / '.env')
 app = Flask(__name__)
 CORS(app)
 
-# Stage 1: Groq OCR
 groq_client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=os.getenv("GROQ_API_KEY"))
-
-# Stage 2: Gemini Analysis
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 gemini_model = genai.GenerativeModel('gemini-3.1-flash-lite-preview')
 
@@ -39,8 +36,7 @@ def process_single_image(file_storage):
             ]}]
         )
         return res.choices[0].message.content
-    except:
-        return ""
+    except: return ""
 
 @app.route('/api/predict', methods=['POST'])
 def predict():
@@ -48,34 +44,36 @@ def predict():
         user_text = request.form.get('userText', '')
         files = request.files.getlist('file')
         
-        # Parallel OCR Processing
         with ThreadPoolExecutor() as executor:
             ocr_results = list(executor.map(process_single_image, files[:5]))
         
         combined_ocr = "\n".join(ocr_results)
 
-        # STRICTOR PROMPT WITH REFINED RANKING & HALLUCINATION CHECK
+        # REFINED PROMPT: Explicitly instructs to include Manual Input items
         prompt = f"""
         CONTEXT:
-        Menu Text: {combined_ocr}
-        Manual Input (comma separated): {user_text}
+        Menu OCR: {combined_ocr}
+        USER MANUAL INPUT: {user_text}
 
         TASK:
-        1. Extract ALL food and drink items from the context.
-        2. Categorize into: 'Appetizer', 'Main Dish', 'Dessert', or 'Drinks'.
-        3. STRICT: Only use items mentioned in the Context. If an item isn't there, do not include it.
-        4. Estimate: Sugar(g), Calories(kcal), GI Value(0-100), and Risk Level (Low, Medium, or High).
-        5. Provide a short health tip (max 10 words).
+        1. Extract items from BOTH Menu OCR AND USER MANUAL INPUT. 
+        2. Categorize: 'Appetizer', 'Main Dish', 'Dessert', 'Drinks'.
+        3. For items like 'Air Putih' or 'Mineral Water', prioritize them in 'Drinks'.
+        4. Estimate: Sugar(g), Calories(kcal), GI Value(0-100), and Risk (Low, Medium, High).
+        5. Provide a tip for EVERY item.
 
-        HALLUCINATION CHECK: 
-        Recognize that plain items (e.g., 'Chinese Tea', 'Mineral Water') have 0g sugar and 0 GI. 
-        Do not rank flavored items (e.g., 'Matcha Jasmine') higher than plain items.
+        RANKING LOGIC:
+        - Priority 1: Risk (Low > Med > High)
+        - Priority 2: Sugar (Lowest first)
+        - Priority 3: GI Value (Lowest first)
+        - Priority 4 (TIE-BREAKER): Calories (Lowest first). 
+          Example: If Lettuce and Gizzard have same Risk/Sugar/GI, Lettuce MUST rank higher because of lower calories.
 
         Output ONLY JSON:
         {{
             "Appetizer": [], "Main Dish": [], "Dessert": [], "Drinks": []
         }}
-        Item format: {{"f": "name", "sugar": num, "c": num, "gi_val": num, "risk": "Low/Medium/High", "tip": "string"}}
+        Item: {{"f": "name", "sugar": num, "c": num, "gi_val": num, "risk": "string", "tip": "string"}}
         """
         
         response = gemini_model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
@@ -86,19 +84,13 @@ def predict():
 
         for cat in ["Appetizer", "Main Dish", "Dessert", "Drinks"]:
             items = raw_data.get(cat, [])
-            
-            # Sanitize and ensure numeric types
             for item in items:
                 item['sugar'] = clean_to_number(item.get('sugar', 0))
                 item['gi_val'] = clean_to_number(item.get('gi_val', 55))
                 item['c'] = clean_to_number(item.get('c', 0))
                 item['risk_score'] = risk_map.get(item.get('risk', 'Medium'), 2)
             
-            # RANKING PRIORITY LOGIC:
-            # 1. Risk Level (Low first)
-            # 2. Sugar Content (Lowest first)
-            # 3. GI Value (Lowest first)
-            # 4. Calories (Lowest first - Final tie-breaker)
+            # Python-side sorting to enforce the tie-breaker
             sorted_items = sorted(items, key=lambda x: (
                 x['risk_score'], 
                 x['sugar'], 
@@ -106,18 +98,12 @@ def predict():
                 x['c']
             ))
             
-            # Remove the internal risk_score before sending to frontend
             for s_item in sorted_items: s_item.pop('risk_score', None)
-
-            final_results[cat] = {
-                "recommended": sorted_items[0] if sorted_items else None,
-                "ranking": sorted_items[:3]
-            }
+            final_results[cat] = {"ranking": sorted_items}
 
         return jsonify(final_results)
 
     except Exception as e:
-        print(f"Server Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
